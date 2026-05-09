@@ -12,37 +12,21 @@
   <body>
     <nav class="navbar">
       <div class="navbar-left">
-        <button
-          class="sidebar-toggle"
-          onclick="toggleSidebar()"
-          title="Toggle sidebar"
-        >
+        <button class="sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar">
           <span id="sidebar-icon">☰</span>
         </button>
         <div class="navbar-logo">
           <div class="navbar-logo-icon">
-            <img
-              src="/static/duckdoclogo.ico"
-              alt="DuckDoc Logo"
-              class="logo-svg"
-            />
+            <img src="/static/duckdoclogo.ico" alt="DuckDoc Logo" class="logo-svg" />
           </div>
           <span>DuckDoc</span>
         </div>
         <div class="navbar-file-path">
-          {{ if .CurrentFile }}
-          <span class="file-name">{{ .CurrentFile }}</span>
-          {{ else }}
-          <span class="file-name">Documentation</span>
-          {{ end }}
+          <span class="file-name">{{ if .CurrentFile }}{{ .CurrentFile }}{{ else }}Documentation{{ end }}</span>
         </div>
       </div>
       <div class="navbar-right">
-        <button
-          class="theme-toggle"
-          onclick="toggleTheme()"
-          title="Toggle theme"
-        >
+        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">
           <span id="theme-icon">🌙</span>
         </button>
         <a href="/" class="navbar-home-link">Home</a>
@@ -55,63 +39,11 @@
       <ul>
         {{ range .TOC }}
         <li class="toc-level-{{ .Level }}">
-          <a href="#{{ .ID }}" onclick="scrollToHeading('{{ .ID }}')"
-            >{{ .Text }}</a
-          >
+          <a href="#{{ .ID }}">{{ .Text }}</a>
         </li>
         {{ end }}
       </ul>
     </aside>
-
-    <script>
-      // Smooth scrolling for TOC links
-      function scrollToHeading(headingId) {
-        const element = document.getElementById(headingId);
-        if (element) {
-          // Calculate offset for fixed navbar
-          const navbarHeight = document.querySelector(".navbar").offsetHeight;
-          const elementPosition = element.offsetTop - navbarHeight - 20; // 20px extra padding
-
-          window.scrollTo({
-            top: elementPosition,
-            behavior: "smooth",
-          });
-        }
-      }
-
-      // Add smooth scrolling CSS if not already present
-      document.documentElement.style.scrollBehavior = "smooth";
-
-      // Highlight current section in TOC on scroll
-      function updateTOCHighlight() {
-        const sections = document.querySelectorAll(
-          "h1[id], h2[id], h3[id], h4[id], h5[id], h6[id]"
-        );
-        const tocLinks = document.querySelectorAll(".toc a");
-
-        let current = "";
-        const navbarHeight = document.querySelector(".navbar").offsetHeight;
-
-        sections.forEach((section) => {
-          const sectionTop = section.offsetTop - navbarHeight - 50;
-          if (window.scrollY >= sectionTop) {
-            current = section.getAttribute("id");
-          }
-        });
-
-        tocLinks.forEach((link) => {
-          link.classList.remove("active");
-          if (link.getAttribute("href") === "#" + current) {
-            link.classList.add("active");
-          }
-        });
-      }
-
-      // Update TOC highlight on scroll
-      window.addEventListener("scroll", updateTOCHighlight);
-      // Initial highlight
-      document.addEventListener("DOMContentLoaded", updateTOCHighlight);
-    </script>
   </body>
 </html>
 {{ end }}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -16,7 +17,7 @@ type TreeNode struct {
 	Name         string
 	Path         string
 	Children     []*TreeNode
-	CompletePath string // Stores the full path from the root to this node
+	CompletePath string
 }
 
 type TOCItem struct {
@@ -33,6 +34,15 @@ type PageData struct {
 	CurrentFile string
 }
 
+// templateFuncs is populated at request time to carry currentFile for active-state highlighting
+func makeTemplateFuncs(currentFile string) template.FuncMap {
+	return template.FuncMap{
+		"defineTree": func(node *TreeNode) template.HTML {
+			return template.HTML(renderTreeHTML(node, currentFile))
+		},
+	}
+}
+
 func main() {
 	http.HandleFunc("/", serveMarkdown)
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
@@ -46,8 +56,77 @@ func main() {
 }
 
 func serveMarkdown(w http.ResponseWriter, r *http.Request) {
-	dir := "content"
-	navbarTree := &TreeNode{Name: "root", Path: "", Children: []*TreeNode{}}
+	navbarTree, err := buildNavTree("content")
+	if err != nil {
+		log.Printf("Error building nav tree: %v", err)
+		http.Error(w, "Error reading content", http.StatusInternalServerError)
+		return
+	}
+
+	if q := r.URL.Query().Get("search"); q != "" {
+		filterTree(navbarTree, q)
+	}
+
+	requestedPath := r.URL.Path
+	var content, relPath string
+	var isSwagger bool
+
+	if requestedPath == "/" {
+		relPath = "README.md"
+		if b, err := os.ReadFile("README.md"); err == nil {
+			content = string(b)
+		} else {
+			content = "# Welcome to DuckDoc\n\nThe README file could not be found."
+		}
+	} else {
+		relPath = strings.TrimPrefix(requestedPath, "/")
+		if b, err := os.ReadFile(filepath.Join("content", relPath)); err == nil {
+			content = string(b)
+			ext := filepath.Ext(relPath)
+			if ext == ".yaml" || ext == ".yml" {
+				trimmed := strings.TrimSpace(content)
+				if strings.HasPrefix(trimmed, "openapi:") || strings.HasPrefix(trimmed, "swagger:") {
+					isSwagger = true
+				}
+			}
+		} else {
+			content = "# File not found\n\nThe requested file could not be found."
+		}
+	}
+
+	funcs := makeTemplateFuncs(relPath)
+
+	if isSwagger {
+		renderSwagger(w, relPath, navbarTree, funcs)
+		return
+	}
+
+	toc := extractTOC(content)
+	processed := processImagePaths(content, relPath)
+	htmlContent := template.HTML(blackfriday.Run([]byte(processed), blackfriday.WithExtensions(blackfriday.CommonExtensions|blackfriday.AutoHeadingIDs)))
+
+	tmpl, err := template.New("layout").Funcs(funcs).ParseFiles("templates/layout.html", "templates/sidebar.html")
+	if err != nil {
+		log.Printf("Template parsing error: %v", err)
+		http.Error(w, "Error loading templates", http.StatusInternalServerError)
+		return
+	}
+
+	page := PageData{
+		Title:       "DuckDoc",
+		Navbar:      navbarTree,
+		Content:     htmlContent,
+		TOC:         toc,
+		CurrentFile: relPath,
+	}
+
+	if err := tmpl.Execute(w, page); err != nil {
+		log.Printf("Template execution error: %v", err)
+	}
+}
+
+func buildNavTree(dir string) (*TreeNode, error) {
+	root := &TreeNode{Name: "root", Path: "", Children: []*TreeNode{}}
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -57,332 +136,237 @@ func serveMarkdown(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		ext := filepath.Ext(path)
-		if ext == ".md" || ext == ".yaml" || ext == ".yml" {
-			relPath, _ := filepath.Rel(dir, path)
-			log.Printf("Processing file: %s", relPath)
+		if ext != ".md" && ext != ".yaml" && ext != ".yml" {
+			return nil
+		}
 
-			// Ensure each file node has a full path
-			parts := strings.Split(filepath.ToSlash(relPath), "/")
-			current := navbarTree
-			var fullPath string
-			for i, part := range parts {
-				var parentPath string
-				parentPath = current.CompletePath
-				fullPath = parentPath
-				found := false
-				for _, child := range current.Children {
-					if child.Name == part {
-						current = child
-						current.CompletePath = filepath.Join(current.CompletePath, part)
-						found = true
-						break
-					}
+		relPath, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+
+		parts := strings.Split(filepath.ToSlash(relPath), "/")
+		current := root
+		for i, part := range parts {
+			found := false
+			for _, child := range current.Children {
+				if child.Name == part {
+					current = child
+					found = true
+					break
 				}
-				if !found {
-					var nodePath string
-					if i == len(parts)-1 {
-						// This is a file, use the relative path from content directory
-						nodePath = "/" + relPath
-					} else {
-						// This is a directory, store the partial path for search purposes
-						folderPath := strings.Join(parts[:i+1], "/")
-						nodePath = "/" + folderPath
-						fullPath = filepath.Join(parentPath, part)
-						log.Printf("Setting fullPath: %s", fullPath)
-					}
-					newNode := &TreeNode{Name: part, Path: nodePath, Children: []*TreeNode{}, CompletePath: fullPath}
-					current.Children = append(current.Children, newNode)
-					current = newNode
-					current.CompletePath = filepath.Join(current.CompletePath, part)
-					log.Printf("Added node: %s with path: %s", part, nodePath)
+			}
+			if !found {
+				var nodePath string
+				if i == len(parts)-1 {
+					nodePath = "/" + relPath
+				} else {
+					nodePath = "/" + strings.Join(parts[:i+1], "/")
 				}
+				completePath := strings.Join(parts[:i+1], "/")
+				newNode := &TreeNode{
+					Name:         part,
+					Path:         nodePath,
+					Children:     []*TreeNode{},
+					CompletePath: completePath,
+				}
+				current.Children = append(current.Children, newNode)
+				current = newNode
 			}
 		}
 		return nil
 	})
+
 	if err != nil {
-		log.Printf("Error walking the directory: %v", err)
-		http.Error(w, "Error reading content", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
-	// Get the search query from the request
-	searchQuery := r.URL.Query().Get("search")
+	collapseChains(root)
+	return root, nil
+}
 
-	// Filter the document tree if a search query is present
-	if searchQuery != "" {
-		filterTree(navbarTree, searchQuery)
+// collapseChains merges folder nodes that have exactly one child folder into one label.
+// e.g. "atlas / docs" with only folder children becomes "atlas/docs"
+func collapseChains(node *TreeNode) {
+	for _, child := range node.Children {
+		collapseChains(child)
 	}
 
-	// Get the requested file path from the URL
-	requestedPath := r.URL.Path
-	var content string
-	var relPath string
-	var isSwagger bool
-
-	if requestedPath == "/" {
-		// Home page - render README.md from root folder
-		readmePath := "README.md"
-		if contentBytes, err := os.ReadFile(readmePath); err == nil {
-			content = string(contentBytes)
-			relPath = "README.md"
-		} else {
-			content = "# Welcome to DuckDoc\n\nThe README file could not be found."
-			relPath = "README.md"
+	for i, child := range node.Children {
+		// Only collapse if the child is a pure folder (no file children) with exactly one child
+		for len(child.Children) == 1 && len(child.Children[0].Children) > 0 {
+			only := child.Children[0]
+			child.Name = child.Name + " / " + only.Name
+			child.Path = only.Path
+			child.CompletePath = only.CompletePath
+			child.Children = only.Children
 		}
-	} else {
-		// Remove leading slash and construct full path
-		relPath = strings.TrimPrefix(requestedPath, "/")
-		contentPath := filepath.Join(dir, relPath)
-
-		if contentBytes, err := os.ReadFile(contentPath); err == nil {
-			content = string(contentBytes)
-			// Check if this is a Swagger/OpenAPI file
-			ext := filepath.Ext(relPath)
-			if ext == ".yaml" || ext == ".yml" {
-				// Check if it's a Swagger file by looking for 'openapi' or 'swagger' at the start
-				if strings.HasPrefix(strings.TrimSpace(content), "openapi:") || strings.HasPrefix(strings.TrimSpace(content), "swagger:") {
-					isSwagger = true
-				}
-			}
-		} else {
-			// If file not found, show default content
-			content = "# File not found\n\nThe requested file could not be found."
-		}
-	}
-
-	// Handle Swagger files differently
-	if isSwagger {
-		renderSwagger(w, relPath, navbarTree)
-		return
-	}
-
-	log.Printf("Content being passed to extractTOC: %s", content)
-	toc := extractTOC(content)
-
-	// Process content to fix image paths
-	processedContent := processImagePaths(content, relPath)
-	htmlContent := template.HTML(blackfriday.Run([]byte(processedContent), blackfriday.WithExtensions(blackfriday.CommonExtensions|blackfriday.AutoHeadingIDs)))
-	tmpl, err := template.New("layout").Funcs(template.FuncMap{
-		"defineTree": func(node *TreeNode) template.HTML {
-			log.Printf("defineTree called with node: %+v", node)
-			var renderTree func(*TreeNode) string
-			renderTree = func(node *TreeNode) string {
-				output := ""
-				if node != nil {
-					if node.Name == "root" {
-						log.Printf("Root node has %d children", len(node.Children))
-						// For root node, render all children directly
-						for _, child := range node.Children {
-							output += renderTree(child)
-						}
-					} else {
-						if len(node.Children) > 0 {
-							output += "<li class=\"folder\" data-full-path=\"" + node.CompletePath + "\"><span class=\"folder-name\">" + node.Name + "</span><ul>"
-							for _, child := range node.Children {
-								output += renderTree(child)
-							}
-							output += "</ul></li>"
-						} else {
-							output += "<li class=\"file\" data-full-path=\"" + node.CompletePath + "\"><a href=\"" + node.Path + "\">" + node.Name + "</a></li>"
-						}
-					}
-				}
-				return output
-			}
-			result := renderTree(node)
-			log.Printf("Generated tree HTML: %s", result)
-			return template.HTML(result)
-		},
-	}).ParseFiles("templates/layout.html", "templates/sidebar.html")
-	if err != nil {
-		log.Printf("Template parsing error: %v", err)
-		http.Error(w, "Error loading templates", http.StatusInternalServerError)
-		return
-	}
-
-	page := PageData{
-		Title:       "Markdown Viewer",
-		Navbar:      navbarTree,
-		Content:     htmlContent,
-		TOC:         toc,
-		CurrentFile: relPath,
-	}
-
-	log.Printf("About to execute template with navbar tree: %+v", navbarTree)
-	if err := tmpl.Execute(w, page); err != nil {
-		log.Printf("Template execution error: %v", err)
-		http.Error(w, "Error rendering page", http.StatusInternalServerError)
+		node.Children[i] = child
 	}
 }
 
-// Function to extract table of contents (headers) from markdown
+// displayName strips the file extension for cleaner sidebar labels
+func displayName(name string) string {
+	ext := filepath.Ext(name)
+	if ext == ".md" || ext == ".yaml" || ext == ".yml" {
+		return strings.TrimSuffix(name, ext)
+	}
+	return name
+}
+
+func renderTreeHTML(node *TreeNode, currentFile string) string {
+	if node == nil {
+		return ""
+	}
+	if node.Name == "root" {
+		var sb strings.Builder
+		for _, child := range node.Children {
+			sb.WriteString(renderTreeHTML(child, currentFile))
+		}
+		return sb.String()
+	}
+
+	fullPath := template.HTMLEscapeString(node.CompletePath)
+	name := template.HTMLEscapeString(displayName(node.Name))
+
+	if len(node.Children) > 0 {
+		// Check if any descendant is the active file to pre-expand the folder
+		active := containsFile(node, currentFile)
+		activeClass := ""
+		if active {
+			activeClass = " active-ancestor"
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, `<li class="folder%s" data-full-path="%s"><span class="folder-name">%s</span><ul>`, activeClass, fullPath, name)
+		for _, child := range node.Children {
+			sb.WriteString(renderTreeHTML(child, currentFile))
+		}
+		sb.WriteString("</ul></li>")
+		return sb.String()
+	}
+
+	path := template.HTMLEscapeString(node.Path)
+	isActive := strings.TrimPrefix(node.Path, "/") == currentFile
+	activeClass := ""
+	if isActive {
+		activeClass = ` class="active"`
+	}
+	return fmt.Sprintf(`<li class="file" data-full-path="%s"><a href="%s"%s>%s</a></li>`, fullPath, path, activeClass, name)
+}
+
+// containsFile reports whether any file descendant matches currentFile
+func containsFile(node *TreeNode, currentFile string) bool {
+	if len(node.Children) == 0 {
+		return strings.TrimPrefix(node.Path, "/") == currentFile
+	}
+	for _, child := range node.Children {
+		if containsFile(child, currentFile) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripInlineMarkdown removes inline backtick spans, keeping the inner text,
+// so that "`foo`" becomes "foo" — matching blackfriday's AutoHeadingIDs behaviour.
+var backtickRegex = regexp.MustCompile("`[^`]*`")
+
+// nonAlphanumHyphen matches anything that is not a lowercase letter, digit, or hyphen.
+var nonAlphanumHyphen = regexp.MustCompile(`[^a-z0-9-]+`)
+
+func headingToID(text string) string {
+	// 1. Strip inline code backticks but keep inner text.
+	id := backtickRegex.ReplaceAllStringFunc(text, func(s string) string {
+		return s[1 : len(s)-1]
+	})
+	// 2. Lowercase.
+	id = strings.ToLower(id)
+	// 3. Replace spaces and word-separating punctuation with hyphens so that
+	//    "ci.yml" → "ci-yml" (matching blackfriday's slugifier).
+	id = strings.ReplaceAll(id, " ", "-")
+	id = strings.ReplaceAll(id, ".", "-")
+	// 4. Remove every remaining character that is not [a-z0-9-].
+	id = nonAlphanumHyphen.ReplaceAllString(id, "")
+	// 5. Collapse consecutive hyphens produced by the steps above.
+	id = regexp.MustCompile(`-{2,}`).ReplaceAllString(id, "-")
+	// 6. Trim leading/trailing hyphens.
+	id = strings.Trim(id, "-")
+	return id
+}
+
 func extractTOC(content string) []TOCItem {
 	var toc []TOCItem
-	lines := strings.Split(content, "\n")
 	headerRegex := regexp.MustCompile(`^(#{1,6})\s+(.*)`)
-	for _, line := range lines {
-		if matches := headerRegex.FindStringSubmatch(line); matches != nil {
-			headingLevel := len(matches[1])
-			headingText := matches[2]
-			headingID := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(headingText, ".", "-"), " ", "-"), "#", ""))
-			toc = append(toc, TOCItem{Level: headingLevel, Text: headingText, ID: headingID})
+	for _, line := range strings.Split(content, "\n") {
+		if m := headerRegex.FindStringSubmatch(line); m != nil {
+			text := m[2]
+			toc = append(toc, TOCItem{Level: len(m[1]), Text: text, ID: headingToID(text)})
 		}
 	}
 	return toc
 }
 
-// Helper function to filter the tree based on the search query
 func filterTree(node *TreeNode, query string) bool {
-	matches := false
-	log.Println("DEBUG: filterTree called for node:", node.Name, ", with query:", query)
-
-	// Check if current node (folder or file) matches the query
 	nodeMatches := matchesQuery(node.Name, node.CompletePath, query)
-	log.Println("Checking node:", node.Name, "Matches:", nodeMatches, "Query:", query)
-	if nodeMatches {
-		matches = true
-	}
 
-	// Always filter children recursively, even if current node matches
-	// This allows us to find nested matches and show full context
-	filteredChildren := []*TreeNode{}
+	var matched []*TreeNode
 	for _, child := range node.Children {
 		if filterTree(child, query) {
-			filteredChildren = append(filteredChildren, child)
-			matches = true
+			matched = append(matched, child)
 		}
 	}
+	node.Children = matched
 
-	// If this node matches, we want to show it and its filtered children
-	// If this node doesn't match but has matching children, we still show it as context
-	node.Children = filteredChildren
-
-	return matches
+	return nodeMatches || len(matched) > 0
 }
 
-// Helper function to check if a string matches the query
 func matchesQuery(name, completePath, query string) bool {
-	queryLower := strings.ToLower(query)
-
-	// Check if the name matches
-	if strings.Contains(strings.ToLower(name), queryLower) {
-		log.Println("DEBUG: matchesQuery found match in name:", name)
-		return true
-	}
-
-	// Check if the complete path matches (for folders and files)
-	if strings.Contains(strings.ToLower(completePath), queryLower) {
-		log.Println("DEBUG: matchesQuery found match in completePath:", completePath)
-		return true
-	}
-
-	return false
+	q := strings.ToLower(query)
+	return strings.Contains(strings.ToLower(name), q) ||
+		strings.Contains(strings.ToLower(completePath), q)
 }
 
-// processImagePaths processes markdown content to fix relative image paths
 func processImagePaths(content, relPath string) string {
-	// Regular expression to match markdown image syntax: ![alt](path)
 	imageRegex := regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
 
-	// Get the directory of the current file
 	var baseDir string
 	if relPath == "README.md" {
-		// For README.md in root, images should be looked up relative to content directory
 		baseDir = "content"
 	} else {
-		// For other files, get the directory of the current file
 		baseDir = filepath.Dir(relPath)
 		if baseDir == "." {
 			baseDir = ""
 		}
 	}
 
-	// Process the content and replace image paths
-	processedContent := imageRegex.ReplaceAllStringFunc(content, func(match string) string {
-		// Extract the alt text and image path
-		matches := imageRegex.FindStringSubmatch(match)
-		if len(matches) != 3 {
-			return match // Return original if parsing fails
+	return imageRegex.ReplaceAllStringFunc(content, func(match string) string {
+		m := imageRegex.FindStringSubmatch(match)
+		if len(m) != 3 {
+			return match
 		}
+		altText, imagePath := m[1], m[2]
 
-		altText := matches[1]
-		imagePath := matches[2]
-
-		// Skip if it's already an absolute URL or starts with /
-		if strings.HasPrefix(imagePath, "http://") || strings.HasPrefix(imagePath, "https://") || strings.HasPrefix(imagePath, "/") {
+		if strings.HasPrefix(imagePath, "http://") ||
+			strings.HasPrefix(imagePath, "https://") ||
+			strings.HasPrefix(imagePath, "/") {
 			return match
 		}
 
-		// Handle relative paths
-		var newPath string
-		if after, ok := strings.CutPrefix(imagePath, "./"); ok {
-			// Remove ./ prefix
-			imagePath = after
+		imagePath = strings.TrimPrefix(imagePath, "./")
 
-			if relPath == "README.md" {
-				// For README.md, images are in the content directory
-				newPath = "/content/" + imagePath
-			} else {
-				// For other files, resolve relative to the file's directory
-				if baseDir == "" {
-					newPath = "/content/" + imagePath
-				} else {
-					newPath = "/content/" + baseDir + "/" + imagePath
-				}
-			}
+		var newPath string
+		if baseDir == "" || relPath == "README.md" {
+			newPath = "/content/" + imagePath
 		} else {
-			// Handle paths without ./ prefix
-			if relPath == "README.md" {
-				newPath = "/content/" + imagePath
-			} else {
-				if baseDir == "" {
-					newPath = "/content/" + imagePath
-				} else {
-					newPath = "/content/" + baseDir + "/" + imagePath
-				}
-			}
+			newPath = "/content/" + baseDir + "/" + imagePath
 		}
 
-		log.Printf("Converted image path: %s -> %s (relPath: %s, baseDir: %s)", imagePath, newPath, relPath, baseDir)
-		log.Printf("Debug: Updated image tag: ![%s](%s)", altText, newPath)
 		return "![" + altText + "](" + newPath + ")"
 	})
-
-	log.Printf("Debug: Finished processing content for relPath: %s\nProcessed Content:\n%s", relPath, processedContent)
-	return processedContent
 }
 
-// renderSwagger renders a Swagger/OpenAPI specification file
-func renderSwagger(w http.ResponseWriter, relPath string, navbarTree *TreeNode) {
-	tmpl, err := template.New("layout").Funcs(template.FuncMap{
-		"defineTree": func(node *TreeNode) template.HTML {
-			var renderTree func(*TreeNode) string
-			renderTree = func(node *TreeNode) string {
-				output := ""
-				if node != nil {
-					if node.Name == "root" {
-						// For root node, render all children directly
-						for _, child := range node.Children {
-							output += renderTree(child)
-						}
-					} else {
-						if len(node.Children) > 0 {
-							output += "<li class=\"folder\" data-full-path=\"" + node.CompletePath + "\"><span class=\"folder-name\">" + node.Name + "</span><ul>"
-							for _, child := range node.Children {
-								output += renderTree(child)
-							}
-							output += "</ul></li>"
-						} else {
-							output += "<li class=\"file\" data-full-path=\"" + node.CompletePath + "\"><a href=\"" + node.Path + "\">" + node.Name + "</a></li>"
-						}
-					}
-				}
-				return output
-			}
-			return template.HTML(renderTree(node))
-		},
-	}).ParseFiles("templates/layout.html", "templates/sidebar.html", "templates/swagger.html")
+func renderSwagger(w http.ResponseWriter, relPath string, navbarTree *TreeNode, funcs template.FuncMap) {
+	tmpl, err := template.New("layout").Funcs(funcs).ParseFiles("templates/layout.html", "templates/sidebar.html", "templates/swagger.html")
 	if err != nil {
 		log.Printf("Template parsing error: %v", err)
 		http.Error(w, "Error loading templates", http.StatusInternalServerError)
@@ -392,13 +376,12 @@ func renderSwagger(w http.ResponseWriter, relPath string, navbarTree *TreeNode) 
 	page := PageData{
 		Title:       "API Documentation",
 		Navbar:      navbarTree,
-		Content:     template.HTML(""), // Content will be rendered by Swagger UI
+		Content:     "",
 		TOC:         []TOCItem{},
 		CurrentFile: relPath,
 	}
 
 	if err := tmpl.Execute(w, page); err != nil {
 		log.Printf("Template execution error: %v", err)
-		http.Error(w, "Error rendering page", http.StatusInternalServerError)
 	}
 }
